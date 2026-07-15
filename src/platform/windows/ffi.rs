@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::os::windows::io::{FromRawHandle, OwnedHandle, RawHandle};
 use std::{io, mem, ptr};
@@ -9,31 +11,30 @@ use windows_sys::Win32::NetworkManagement::IpHelper::{
     CreateIpForwardEntry2, CreateUnicastIpAddressEntry, DeleteIpForwardEntry2,
     DeleteUnicastIpAddressEntry, FreeMibTable, GetIpForwardTable2, GetIpInterfaceEntry,
     GetIpInterfaceTable, GetUnicastIpAddressTable, InitializeIpForwardEntry,
-    InitializeUnicastIpAddressEntry, SetIpInterfaceEntry, MIB_IPFORWARD_ROW2, MIB_IPFORWARD_TABLE2,
-    MIB_IPINTERFACE_ROW, MIB_IPINTERFACE_TABLE, MIB_UNICASTIPADDRESS_ROW,
-    MIB_UNICASTIPADDRESS_TABLE,
+    InitializeUnicastIpAddressEntry, MIB_IPFORWARD_ROW2, MIB_IPFORWARD_TABLE2, MIB_IPINTERFACE_ROW,
+    MIB_IPINTERFACE_TABLE, MIB_UNICASTIPADDRESS_ROW, MIB_UNICASTIPADDRESS_TABLE,
+    SetIpInterfaceEntry,
 };
 use windows_sys::Win32::Networking::WinSock::{
-    NlroManual, AF_INET, AF_INET6, MIB_IPPROTO_NETMGMT, SOCKADDR_INET,
+    AF_INET, AF_INET6, MIB_IPPROTO_NETMGMT, NlroManual, SOCKADDR_INET,
 };
+use windows_sys::Win32::System::IO::{GetOverlappedResult, OVERLAPPED};
 use windows_sys::Win32::System::Threading::{ResetEvent, SetEvent};
-use windows_sys::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
 use windows_sys::{
-    core::{BOOL, GUID},
     Win32::{
         Devices::DeviceAndDriverInstallation::{
-            SetupDiBuildDriverInfoList, SetupDiCallClassInstaller, SetupDiClassNameFromGuidW,
-            SetupDiCreateDeviceInfoList, SetupDiCreateDeviceInfoW, SetupDiDestroyDeviceInfoList,
-            SetupDiDestroyDriverInfoList, SetupDiEnumDeviceInfo, SetupDiEnumDriverInfoW,
-            SetupDiGetClassDevsW, SetupDiGetDeviceRegistryPropertyW, SetupDiGetDriverInfoDetailW,
-            SetupDiOpenDevRegKey, SetupDiSetClassInstallParamsW, SetupDiSetDeviceRegistryPropertyW,
-            SetupDiSetSelectedDevice, SetupDiSetSelectedDriverW, DICS_DISABLE, DICS_ENABLE,
-            DICS_FLAG_GLOBAL, DIF_PROPERTYCHANGE, HDEVINFO, MAX_CLASS_NAME_LEN,
-            SP_CLASSINSTALL_HEADER, SP_DEVINFO_DATA, SP_DRVINFO_DATA_V2_W,
-            SP_DRVINFO_DETAIL_DATA_W, SP_PROPCHANGE_PARAMS,
+            DICS_DISABLE, DICS_ENABLE, DICS_FLAG_GLOBAL, DIF_PROPERTYCHANGE, HDEVINFO,
+            MAX_CLASS_NAME_LEN, SP_CLASSINSTALL_HEADER, SP_DEVINFO_DATA, SP_DRVINFO_DATA_V2_W,
+            SP_DRVINFO_DETAIL_DATA_W, SP_PROPCHANGE_PARAMS, SetupDiBuildDriverInfoList,
+            SetupDiCallClassInstaller, SetupDiClassNameFromGuidW, SetupDiCreateDeviceInfoList,
+            SetupDiCreateDeviceInfoW, SetupDiDestroyDeviceInfoList, SetupDiDestroyDriverInfoList,
+            SetupDiEnumDeviceInfo, SetupDiEnumDriverInfoW, SetupDiGetClassDevsW,
+            SetupDiGetDeviceRegistryPropertyW, SetupDiGetDriverInfoDetailW, SetupDiOpenDevRegKey,
+            SetupDiSetClassInstallParamsW, SetupDiSetDeviceRegistryPropertyW,
+            SetupDiSetSelectedDevice, SetupDiSetSelectedDriverW,
         },
         Foundation::{
-            CloseHandle, GetLastError, ERROR_NO_MORE_ITEMS, FALSE, FILETIME, HANDLE, TRUE,
+            CloseHandle, ERROR_NO_MORE_ITEMS, FALSE, FILETIME, GetLastError, HANDLE, TRUE,
         },
         NetworkManagement::{
             IpHelper::{
@@ -43,16 +44,17 @@ use windows_sys::{
             Ndis::NET_LUID_LH,
         },
         Storage::FileSystem::{
-            CreateFileW, ReadFile, WriteFile, FILE_CREATION_DISPOSITION, FILE_FLAGS_AND_ATTRIBUTES,
-            FILE_SHARE_MODE,
+            CreateFileW, FILE_CREATION_DISPOSITION, FILE_FLAGS_AND_ATTRIBUTES, FILE_SHARE_MODE,
+            ReadFile, WriteFile,
         },
         System::{
             Com::StringFromGUID2,
-            Registry::{RegNotifyChangeKeyValue, HKEY},
-            Threading::{CreateEventW, WaitForSingleObject},
             IO::DeviceIoControl,
+            Registry::{HKEY, RegNotifyChangeKeyValue},
+            Threading::{CreateEventW, WaitForSingleObject},
         },
     },
+    core::{BOOL, GUID},
 };
 
 #[allow(non_camel_case_types)]
@@ -125,6 +127,7 @@ pub fn luid_to_alias(luid: &NET_LUID_LH) -> io::Result<String> {
         _err => Err(io::Error::last_os_error()),
     }
 }
+
 pub fn reset_event(handle: RawHandle) -> io::Result<()> {
     unsafe {
         if FALSE == ResetEvent(handle) {
@@ -133,6 +136,7 @@ pub fn reset_event(handle: RawHandle) -> io::Result<()> {
     }
     Ok(())
 }
+
 pub fn wait_for_single_object(handle: RawHandle, timeout: u32) -> io::Result<()> {
     unsafe {
         if 0 == WaitForSingleObject(handle, timeout) {
@@ -142,6 +146,7 @@ pub fn wait_for_single_object(handle: RawHandle, timeout: u32) -> io::Result<()>
         }
     }
 }
+
 pub fn set_event(handle: RawHandle) -> io::Result<()> {
     unsafe {
         if FALSE == SetEvent(handle) {
@@ -150,6 +155,7 @@ pub fn set_event(handle: RawHandle) -> io::Result<()> {
     }
     Ok(())
 }
+
 pub fn create_event() -> io::Result<OwnedHandle> {
     unsafe {
         let read_event_handle = CreateEventW(ptr::null_mut(), 1, 0, ptr::null_mut());
@@ -242,6 +248,7 @@ pub fn try_write_file(
         }
     }
 }
+
 fn error_map() -> io::Error {
     let e = io::Error::last_os_error();
     if e.raw_os_error().unwrap_or(0) == ERROR_IO_PENDING as i32 {
@@ -264,13 +271,6 @@ pub fn try_io_overlapped(handle: HANDLE, io_overlapped: &OVERLAPPED) -> io::Resu
         } else {
             Ok(ret)
         }
-    }
-}
-#[allow(dead_code)]
-pub fn cancel_io_overlapped(handle: HANDLE, io_overlapped: &OVERLAPPED) -> io::Result<u32> {
-    unsafe {
-        CancelIoEx(handle, io_overlapped);
-        wait_io_overlapped(handle, io_overlapped)
     }
 }
 

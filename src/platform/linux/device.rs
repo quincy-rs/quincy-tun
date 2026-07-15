@@ -1,23 +1,23 @@
 use crate::platform::linux::offload::{
-    gso_none_checksum, gso_split, handle_gro, VirtioNetHdr, VIRTIO_NET_HDR_F_NEEDS_CSUM,
-    VIRTIO_NET_HDR_GSO_NONE, VIRTIO_NET_HDR_GSO_TCPV4, VIRTIO_NET_HDR_GSO_TCPV6,
-    VIRTIO_NET_HDR_GSO_UDP_L4, VIRTIO_NET_HDR_LEN,
+    VIRTIO_NET_HDR_F_NEEDS_CSUM, VIRTIO_NET_HDR_GSO_NONE, VIRTIO_NET_HDR_GSO_TCPV4,
+    VIRTIO_NET_HDR_GSO_TCPV6, VIRTIO_NET_HDR_GSO_UDP_L4, VIRTIO_NET_HDR_LEN, VirtioNetHdr,
+    gso_none_checksum, gso_split, handle_gro,
 };
 use crate::platform::unix::device::{ctl, ctl_v6};
 use crate::platform::{ExpandBuffer, GROTable};
 use crate::{
-    builder::{DeviceConfig, Layer},
+    ToIpv4Address, ToIpv4Netmask, ToIpv6Address, ToIpv6Netmask,
+    builder::DeviceConfig,
     platform::linux::sys::*,
     platform::{
-        unix::{ipaddr_to_sockaddr, sockaddr_union, Fd, Tun},
         ETHER_ADDR_LEN,
+        unix::{Fd, Tun, ipaddr_to_sockaddr, sockaddr_union},
     },
-    ToIpv4Address, ToIpv4Netmask, ToIpv6Address, ToIpv6Netmask,
 };
 use ipnet::IpNet;
 use libc::{
-    self, c_char, c_short, ifreq, in6_ifreq, ARPHRD_ETHER, IFF_MULTI_QUEUE, IFF_NO_PI, IFF_RUNNING,
-    IFF_TAP, IFF_TUN, IFF_UP, IFNAMSIZ, O_RDWR,
+    self, ARPHRD_ETHER, IFF_NO_PI, IFF_RUNNING, IFF_TUN, IFF_UP, IFNAMSIZ, O_RDWR, c_char, c_short,
+    ifreq, in6_ifreq,
 };
 use std::net::Ipv6Addr;
 use std::sync::{Arc, RwLock};
@@ -36,7 +36,6 @@ pub struct DeviceImpl {
     pub(crate) tun: Tun,
     pub(crate) vnet_hdr: bool,
     pub(crate) udp_gso: bool,
-    flags: c_short,
     pub(crate) op_lock: Arc<RwLock<()>>,
 }
 
@@ -65,6 +64,8 @@ impl DeviceImpl {
         // This way, we don't fail if someone races us to create the device node.
         if let Ok(false) = std::fs::exists("/dev/net/tun") {
             std::fs::create_dir_all("/dev/net").ok();
+            // SAFETY: `mknod` creates a character device node with well-known
+            // major/minor (10, 200). Errors are intentionally ignored.
             unsafe {
                 libc::mknod(
                     c"/dev/net/tun".as_ptr(),
@@ -74,6 +75,9 @@ impl DeviceImpl {
             }
         }
 
+        // SAFETY: `ifreq` is POD (zeroed is valid); `dev_name` length was checked <= IFNAMSIZ;
+        // `libc::open`/`tunsetiff`/`tunsetoffload` are called with valid pointers.
+        // SAFETY: ctl() returns a valid fd; request() returns a properly initialised ifreq.
         unsafe {
             let mut req: ifreq = mem::zeroed();
 
@@ -84,16 +88,13 @@ impl DeviceImpl {
                     dev_name.as_bytes_with_nul().len(),
                 );
             }
-            let multi_queue = config.multi_queue.unwrap_or(false);
-            let device_type: c_short = config.layer.unwrap_or(Layer::L3).into();
+            let device_type: c_short = IFF_TUN as c_short;
             let iff_no_pi = IFF_NO_PI as c_short;
             let iff_vnet_hdr = libc::IFF_VNET_HDR as c_short;
-            let iff_multi_queue = IFF_MULTI_QUEUE as c_short;
             let packet_information = config.packet_information.unwrap_or(false);
             let offload = config.offload.unwrap_or(false);
             req.ifr_ifru.ifru_flags = device_type
                 | if packet_information { 0 } else { iff_no_pi }
-                | if multi_queue { iff_multi_queue } else { 0 }
                 | if offload { iff_vnet_hdr } else { 0 };
 
             let fd = libc::open(
@@ -142,90 +143,35 @@ impl DeviceImpl {
                 tun: Tun::new(tun_fd),
                 vnet_hdr,
                 udp_gso,
-                flags: req.ifr_ifru.ifru_flags,
                 op_lock: Arc::new(RwLock::new(())),
             };
             Ok(device)
         }
     }
-    unsafe fn set_tcp_offloads(&self) -> io::Result<()> {
-        let tun_tcp_offloads = libc::TUN_F_CSUM | libc::TUN_F_TSO4 | libc::TUN_F_TSO6;
-        tunsetoffload(self.as_raw_fd(), tun_tcp_offloads as _)
-            .map(|_| ())
-            .map_err(|e| e.into())
-    }
-    unsafe fn set_tcp_udp_offloads(&self) -> io::Result<()> {
-        let tun_tcp_offloads = libc::TUN_F_CSUM | libc::TUN_F_TSO4 | libc::TUN_F_TSO6;
-        let tun_udp_offloads = libc::TUN_F_USO4 | libc::TUN_F_USO6;
-        tunsetoffload(self.as_raw_fd(), (tun_tcp_offloads | tun_udp_offloads) as _)
-            .map(|_| ())
-            .map_err(|e| e.into())
-    }
+
     pub(crate) fn from_tun(tun: Tun) -> io::Result<Self> {
         Ok(Self {
             tun,
             vnet_hdr: false,
             udp_gso: false,
-            flags: 0,
             op_lock: Arc::new(RwLock::new(())),
         })
     }
 
-    /// # Prerequisites
-    /// - The `IFF_MULTI_QUEUE` flag must be enabled.
-    /// - The system must support network interface multi-queue functionality.
-    ///
-    /// # Description
-    /// When multi-queue is enabled, create a new queue by duplicating an existing one.
-    pub(crate) fn try_clone(&self) -> io::Result<DeviceImpl> {
-        let flags = self.flags;
-        if flags & (IFF_MULTI_QUEUE as c_short) != IFF_MULTI_QUEUE as c_short {
-            return Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "iff_multi_queue not enabled",
-            ));
-        }
-        unsafe {
-            let mut req = self.request()?;
-            req.ifr_ifru.ifru_flags = flags;
-            let fd = libc::open(
-                c"/dev/net/tun".as_ptr() as *const _,
-                O_RDWR | libc::O_CLOEXEC,
-            );
-            let tun_fd = Fd::new(fd)?;
-            if let Err(err) = tunsetiff(tun_fd.inner, &mut req as *mut _ as *mut _) {
-                return Err(io::Error::from(err));
-            }
-            let dev = DeviceImpl {
-                tun: Tun::new(tun_fd),
-                vnet_hdr: self.vnet_hdr,
-                udp_gso: self.udp_gso,
-                flags,
-                op_lock: self.op_lock.clone(),
-            };
-            if dev.vnet_hdr {
-                if dev.udp_gso {
-                    dev.set_tcp_udp_offloads()?
-                } else {
-                    dev.set_tcp_offloads()?;
-                }
-            }
-
-            Ok(dev)
-        }
-    }
     /// Returns whether UDP Generic Segmentation Offload (GSO) is enabled.
     ///
     /// This is determined by the `udp_gso` flag in the device.
     pub fn udp_gso(&self) -> bool {
         self.udp_gso
     }
+
     /// Returns whether TCP Generic Segmentation Offload (GSO) is enabled.
     ///
     /// In this implementation, this is represented by the `vnet_hdr` flag.
     pub fn tcp_gso(&self) -> bool {
         self.vnet_hdr
     }
+
     /// Sets the transmit queue length for the network interface.
     ///
     /// This method constructs an interface request (`ifreq`) structure,
@@ -234,6 +180,7 @@ impl DeviceImpl {
     /// If the underlying operation fails, an I/O error is returned.
     pub fn set_tx_queue_len(&self, tx_queue_len: u32) -> io::Result<()> {
         let _guard = self.op_lock.write().unwrap();
+        // SAFETY: ctl() returns a valid fd; request() returns a properly initialised ifreq.
         unsafe {
             let mut ifreq = self.request()?;
             ifreq.ifr_ifru.ifru_metric = tx_queue_len as _;
@@ -243,12 +190,14 @@ impl DeviceImpl {
         }
         Ok(())
     }
+
     /// Retrieves the current transmit queue length for the network interface.
     ///
     /// This function constructs an interface request structure and calls `tx_queue_len`
     /// to populate it with the current transmit queue length. The value is then returned.
     pub fn tx_queue_len(&self) -> io::Result<u32> {
         let _guard = self.op_lock.read().unwrap();
+        // SAFETY: ctl() returns a valid fd; request() returns a properly initialised ifreq.
         unsafe {
             let mut ifreq = self.request()?;
             if let Err(err) = tx_queue_len(ctl()?.as_raw_fd(), &mut ifreq) {
@@ -257,6 +206,7 @@ impl DeviceImpl {
             Ok(ifreq.ifr_ifru.ifru_metric as _)
         }
     }
+
     /// Make the device persistent.
     ///
     /// By default, TUN/TAP devices are destroyed when the process exits.
@@ -268,12 +218,12 @@ impl DeviceImpl {
     /// ```no_run
     /// # #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
     /// # {
-    /// use tun_rs::DeviceBuilder;
+    /// use quincy_tun::DeviceBuilder;
     ///
     /// let dev = DeviceBuilder::new()
     ///     .name("persistent-tun")
     ///     .ipv4("10.0.0.1", 24, None)
-    ///     .build_sync()?;
+    ///     .build_async()?;
     ///
     /// // Make the device persistent so it survives after program exit
     /// dev.persist()?;
@@ -283,6 +233,7 @@ impl DeviceImpl {
     /// ```
     pub fn persist(&self) -> io::Result<()> {
         let _guard = self.op_lock.write().unwrap();
+        // SAFETY: ctl() returns a valid fd; request() returns a properly initialised ifreq.
         unsafe {
             if let Err(err) = tunsetpersist(self.as_raw_fd(), &1) {
                 Err(io::Error::from(err))
@@ -301,11 +252,11 @@ impl DeviceImpl {
     /// ```no_run
     /// # #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
     /// # {
-    /// use tun_rs::DeviceBuilder;
+    /// use quincy_tun::DeviceBuilder;
     ///
     /// let dev = DeviceBuilder::new()
     ///     .ipv4("10.0.0.1", 24, None)
-    ///     .build_sync()?;
+    ///     .build_async()?;
     ///
     /// // Set ownership to UID 1000 (typical first user on Linux)
     /// dev.user(1000)?;
@@ -315,6 +266,7 @@ impl DeviceImpl {
     /// ```
     pub fn user(&self, value: i32) -> io::Result<()> {
         let _guard = self.op_lock.write().unwrap();
+        // SAFETY: ctl() returns a valid fd; request() returns a properly initialised ifreq.
         unsafe {
             if let Err(err) = tunsetowner(self.as_raw_fd(), &value) {
                 Err(io::Error::from(err))
@@ -333,11 +285,11 @@ impl DeviceImpl {
     /// ```no_run
     /// # #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
     /// # {
-    /// use tun_rs::DeviceBuilder;
+    /// use quincy_tun::DeviceBuilder;
     ///
     /// let dev = DeviceBuilder::new()
     ///     .ipv4("10.0.0.1", 24, None)
-    ///     .build_sync()?;
+    ///     .build_async()?;
     ///
     /// // Set group ownership to GID 1000
     /// dev.group(1000)?;
@@ -347,6 +299,7 @@ impl DeviceImpl {
     /// ```
     pub fn group(&self, value: i32) -> io::Result<()> {
         let _guard = self.op_lock.write().unwrap();
+        // SAFETY: ctl() returns a valid fd; request() returns a properly initialised ifreq.
         unsafe {
             if let Err(err) = tunsetgroup(self.as_raw_fd(), &value) {
                 Err(io::Error::from(err))
@@ -355,6 +308,7 @@ impl DeviceImpl {
             }
         }
     }
+
     /// Sends multiple packets in a batch with GRO (Generic Receive Offload) coalescing.
     ///
     /// This method allows efficient transmission of multiple packets by batching them together
@@ -378,15 +332,13 @@ impl DeviceImpl {
     ///
     /// ```no_run
     /// # #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
-    /// # {
-    /// use tun_rs::{DeviceBuilder, GROTable, VIRTIO_NET_HDR_LEN};
+    /// # async fn example() -> std::io::Result<()> {
+    /// use quincy_tun::{DeviceBuilder, GROTable, VIRTIO_NET_HDR_LEN};
     ///
     /// let dev = DeviceBuilder::new()
     ///     .ipv4("10.0.0.1", 24, None)
-    ///     .with(|builder| {
-    ///         builder.offload(true) // Enable offload for GRO
-    ///     })
-    ///     .build_sync()?;
+    ///     .offload(true)
+    ///     .build_async()?;
     ///
     /// let mut gro_table = GROTable::default();
     /// let offset = VIRTIO_NET_HDR_LEN;
@@ -399,10 +351,9 @@ impl DeviceImpl {
     /// let mut bufs = vec![packet1, packet2];
     ///
     /// // Send all packets in one batch
-    /// let bytes_sent = dev.send_multiple(&mut gro_table, &mut bufs, offset)?;
+    /// let bytes_sent = dev.send_multiple(&mut gro_table, &mut bufs, offset).await?;
     /// println!("Sent {} bytes across {} packets", bytes_sent, bufs.len());
-    /// # }
-    /// # Ok::<(), std::io::Error>(())
+    /// # Ok(()) }
     /// ```
     ///
     /// # Platform
@@ -422,6 +373,7 @@ impl DeviceImpl {
     ) -> io::Result<usize> {
         self.send_multiple0(gro_table, bufs, offset, |tun, buf| tun.send(buf))
     }
+
     pub(crate) fn send_multiple0<B: ExpandBuffer, W: FnMut(&Tun, &[u8]) -> io::Result<usize>>(
         &self,
         gro_table: &mut GROTable,
@@ -469,10 +421,8 @@ impl DeviceImpl {
                     total += n;
                 }
                 Err(e) => {
-                    if let Some(code) = e.raw_os_error() {
-                        if libc::EBADFD == code {
-                            return Err(e);
-                        }
+                    if e.raw_os_error() == Some(libc::EBADFD) {
+                        return Err(e);
                     }
                     err = Err(e)
                 }
@@ -481,6 +431,7 @@ impl DeviceImpl {
         err?;
         Ok(total)
     }
+
     /// Receives multiple packets in a batch with GSO (Generic Segmentation Offload) splitting.
     ///
     /// When offload is enabled, this method can receive large GSO packets from the TUN device
@@ -507,15 +458,13 @@ impl DeviceImpl {
     ///
     /// ```no_run
     /// # #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
-    /// # {
-    /// use tun_rs::{DeviceBuilder, IDEAL_BATCH_SIZE, VIRTIO_NET_HDR_LEN};
+    /// # async fn example() -> std::io::Result<()> {
+    /// use quincy_tun::{DeviceBuilder, IDEAL_BATCH_SIZE, VIRTIO_NET_HDR_LEN};
     ///
     /// let dev = DeviceBuilder::new()
     ///     .ipv4("10.0.0.1", 24, None)
-    ///     .with(|builder| {
-    ///         builder.offload(true) // Enable offload for GSO
-    ///     })
-    ///     .build_sync()?;
+    ///     .offload(true)
+    ///     .build_async()?;
     ///
     /// // Buffer for the raw received packet (with virtio header)
     /// let mut original_buffer = vec![0u8; VIRTIO_NET_HDR_LEN + 65535];
@@ -525,19 +474,16 @@ impl DeviceImpl {
     /// let mut sizes = vec![0usize; IDEAL_BATCH_SIZE];
     /// let offset = 0;
     ///
-    /// loop {
-    ///     // Receive and segment packets
-    ///     let num_packets = dev.recv_multiple(&mut original_buffer, &mut bufs, &mut sizes, offset)?;
+    /// // Receive and segment packets
+    /// let num_packets = dev.recv_multiple(&mut original_buffer, &mut bufs, &mut sizes, offset).await?;
     ///
-    ///     // Process each segmented packet
-    ///     for i in 0..num_packets {
-    ///         let packet = &bufs[i][offset..offset + sizes[i]];
-    ///         println!("Received packet {}: {} bytes", i, sizes[i]);
-    ///         // Process packet...
-    ///     }
+    /// // Process each segmented packet
+    /// for i in 0..num_packets {
+    ///     let packet = &bufs[i][offset..offset + sizes[i]];
+    ///     println!("Received packet {}: {} bytes", i, sizes[i]);
+    ///     // Process packet...
     /// }
-    /// # }
-    /// # Ok::<(), std::io::Error>(())
+    /// # Ok(()) }
     /// ```
     ///
     /// # Platform
@@ -560,6 +506,7 @@ impl DeviceImpl {
             tun.recv(buf)
         })
     }
+
     pub(crate) fn recv_multiple0<
         B: AsRef<[u8]> + AsMut<[u8]>,
         R: Fn(&Tun, &mut [u8]) -> io::Result<usize>,
@@ -601,6 +548,7 @@ impl DeviceImpl {
             Ok(1)
         }
     }
+
     /// https://github.com/WireGuard/wireguard-go/blob/12269c2761734b15625017d8565745096325392f/tun/tun_linux.go#L375
     /// handleVirtioRead splits in into bufs, leaving offset bytes at the front of
     /// each buffer. It mutates sizes to reflect the size of each element of bufs,
@@ -636,7 +584,7 @@ impl DeviceImpl {
                 // This means CHECKSUM_PARTIAL in skb context. We are responsible
                 // for computing the checksum starting at hdr.csumStart and placing
                 // at hdr.csumOffset.
-                gso_none_checksum(input, hdr.csum_start, hdr.csum_offset);
+                gso_none_checksum(input, hdr.csum_start, hdr.csum_offset)?;
             }
             if bufs[0].as_ref()[offset..].len() < len {
                 Err(io::Error::other(format!(
@@ -721,7 +669,7 @@ impl DeviceImpl {
                 hdr.hdr_len, hdr.csum_start
             )))?
         }
-        let c_sum_at = (hdr.csum_start + hdr.csum_offset) as usize;
+        let c_sum_at = hdr.csum_start as usize + hdr.csum_offset as usize;
         if c_sum_at + 1 >= len {
             Err(io::Error::other(format!(
                 "end of checksum offset ({}) exceeds packet length ({len})",
@@ -730,7 +678,9 @@ impl DeviceImpl {
         }
         gso_split(input, hdr, bufs, sizes, offset, ip_version == 6)
     }
+
     pub fn remove_address_v6_impl(&self, addr: Ipv6Addr, prefix: u8) -> io::Result<()> {
+        // SAFETY: ctl() returns a valid fd; request() returns a properly initialised ifreq.
         unsafe {
             let if_index = self.if_index_impl()?;
             let ctl = ctl_v6()?;
@@ -750,10 +700,19 @@ impl DeviceImpl {
 
 impl DeviceImpl {
     /// Prepare a new request.
+    ///
+    /// # Safety
+    ///
+    /// The device must be open and its name must be queryable.
     unsafe fn request(&self) -> io::Result<ifreq> {
-        request(&self.name_impl()?)
+        unsafe {
+            // SAFETY: delegates to the free-standing `request` with a valid device name.
+            request(&self.name_impl()?)
+        }
     }
+
     fn set_address_v4(&self, addr: Ipv4Addr) -> io::Result<()> {
+        // SAFETY: ctl() returns a valid fd; request() returns a properly initialised ifreq.
         unsafe {
             let mut req = self.request()?;
             ipaddr_to_sockaddr(addr, 0, &mut req.ifr_ifru.ifru_addr, OVERWRITE_SIZE);
@@ -763,7 +722,9 @@ impl DeviceImpl {
         }
         Ok(())
     }
+
     fn set_netmask(&self, value: Ipv4Addr) -> io::Result<()> {
+        // SAFETY: ctl() returns a valid fd; request() returns a properly initialised ifreq.
         unsafe {
             let mut req = self.request()?;
             ipaddr_to_sockaddr(value, 0, &mut req.ifr_ifru.ifru_netmask, OVERWRITE_SIZE);
@@ -775,6 +736,7 @@ impl DeviceImpl {
     }
 
     fn set_destination(&self, value: Ipv4Addr) -> io::Result<()> {
+        // SAFETY: ctl() returns a valid fd; request() returns a properly initialised ifreq.
         unsafe {
             let mut req = self.request()?;
             ipaddr_to_sockaddr(value, 0, &mut req.ifr_ifru.ifru_dstaddr, OVERWRITE_SIZE);
@@ -787,10 +749,12 @@ impl DeviceImpl {
 
     /// Retrieves the name of the network interface.
     pub(crate) fn name_impl(&self) -> io::Result<String> {
+        // SAFETY: ctl() returns a valid fd; request() returns a properly initialised ifreq.
         unsafe { name(self.as_raw_fd()) }
     }
 
     fn ifru_flags(&self) -> io::Result<i16> {
+        // SAFETY: ctl() returns a valid fd; request() returns a properly initialised ifreq.
         unsafe {
             let ctl = ctl()?;
             let mut req = self.request()?;
@@ -815,17 +779,19 @@ impl DeviceImpl {
     }
 }
 
-//Public User Interface
 impl DeviceImpl {
     /// Retrieves the name of the network interface.
     pub fn name(&self) -> io::Result<String> {
         let _guard = self.op_lock.read().unwrap();
         self.name_impl()
     }
+
+    /// Removes an IPv6 address/prefix from the interface.
     pub fn remove_address_v6(&self, addr: Ipv6Addr, prefix: u8) -> io::Result<()> {
         let _guard = self.op_lock.write().unwrap();
         self.remove_address_v6_impl(addr, prefix)
     }
+
     /// Sets a new name for the network interface.
     ///
     /// This function converts the provided name into a C-compatible string,
@@ -838,12 +804,12 @@ impl DeviceImpl {
     /// ```no_run
     /// # #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
     /// # {
-    /// use tun_rs::DeviceBuilder;
+    /// use quincy_tun::DeviceBuilder;
     ///
     /// let dev = DeviceBuilder::new()
     ///     .name("tun0")
     ///     .ipv4("10.0.0.1", 24, None)
-    ///     .build_sync()?;
+    ///     .build_async()?;
     ///
     /// // Rename the device
     /// dev.set_name("vpn-tun")?;
@@ -853,6 +819,7 @@ impl DeviceImpl {
     /// ```
     pub fn set_name(&self, value: &str) -> io::Result<()> {
         let _guard = self.op_lock.write().unwrap();
+        // SAFETY: ctl() returns a valid fd; request() returns a properly initialised ifreq.
         unsafe {
             let tun_name = CString::new(value)?;
 
@@ -874,6 +841,7 @@ impl DeviceImpl {
             Ok(())
         }
     }
+
     /// Checks whether the network interface is currently running.
     ///
     /// The interface is considered running if both the IFF_UP and IFF_RUNNING flags are set.
@@ -882,12 +850,14 @@ impl DeviceImpl {
         let flags = self.ifru_flags()?;
         Ok(flags & (IFF_UP | IFF_RUNNING) as c_short == (IFF_UP | IFF_RUNNING) as c_short)
     }
+
     /// Enables or disables the network interface.
     ///
     /// If `value` is true, the interface is enabled by setting the IFF_UP and IFF_RUNNING flags.
     /// If false, the IFF_UP flag is cleared. The change is applied using a system call.
     pub fn enabled(&self, value: bool) -> io::Result<()> {
         let _guard = self.op_lock.write().unwrap();
+        // SAFETY: ctl() returns a valid fd; request() returns a properly initialised ifreq.
         unsafe {
             let ctl = ctl()?;
             let mut req = self.request()?;
@@ -909,6 +879,7 @@ impl DeviceImpl {
             Ok(())
         }
     }
+
     /// Retrieves the broadcast address of the network interface.
     ///
     /// This function populates an interface request with the broadcast address via a system call,
@@ -919,11 +890,11 @@ impl DeviceImpl {
     /// ```no_run
     /// # #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
     /// # {
-    /// use tun_rs::DeviceBuilder;
+    /// use quincy_tun::DeviceBuilder;
     ///
     /// let dev = DeviceBuilder::new()
     ///     .ipv4("10.0.0.1", 24, None)
-    ///     .build_sync()?;
+    ///     .build_async()?;
     ///
     /// // Get the broadcast address
     /// let broadcast = dev.broadcast()?;
@@ -933,6 +904,7 @@ impl DeviceImpl {
     /// ```
     pub fn broadcast(&self) -> io::Result<IpAddr> {
         let _guard = self.op_lock.read().unwrap();
+        // SAFETY: ctl() returns a valid fd; request() returns a properly initialised ifreq.
         unsafe {
             let mut req = self.request()?;
             if let Err(err) = siocgifbrdaddr(ctl()?.as_raw_fd(), &mut req) {
@@ -942,12 +914,14 @@ impl DeviceImpl {
             Ok(std::net::SocketAddr::try_from(sa)?.ip())
         }
     }
+
     /// Sets the broadcast address of the network interface.
     ///
     /// This function converts the given IP address into a sockaddr structure (with a specified overwrite size)
     /// and then applies it to the interface via a system call.
     pub fn set_broadcast(&self, value: IpAddr) -> io::Result<()> {
         let _guard = self.op_lock.write().unwrap();
+        // SAFETY: ctl() returns a valid fd; request() returns a properly initialised ifreq.
         unsafe {
             let mut req = self.request()?;
             ipaddr_to_sockaddr(value, 0, &mut req.ifr_ifru.ifru_broadaddr, OVERWRITE_SIZE);
@@ -957,6 +931,7 @@ impl DeviceImpl {
             Ok(())
         }
     }
+
     /// Sets the IPv4 network address, netmask, and an optional destination address.
     /// Remove all previous set IPv4 addresses and set the specified address.
     ///
@@ -965,11 +940,11 @@ impl DeviceImpl {
     /// ```no_run
     /// # #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
     /// # {
-    /// use tun_rs::DeviceBuilder;
+    /// use quincy_tun::DeviceBuilder;
     ///
     /// let dev = DeviceBuilder::new()
     ///     .ipv4("10.0.0.1", 24, None)
-    ///     .build_sync()?;
+    ///     .build_async()?;
     ///
     /// // Change the primary IPv4 address
     /// dev.set_network_address("10.1.0.1", 24, None)?;
@@ -992,6 +967,7 @@ impl DeviceImpl {
         }
         Ok(())
     }
+
     /// Add IPv4 network address and netmask to the interface.
     ///
     /// This allows multiple IPv4 addresses on a single TUN/TAP device.
@@ -1001,11 +977,11 @@ impl DeviceImpl {
     /// ```no_run
     /// # #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
     /// # {
-    /// use tun_rs::DeviceBuilder;
+    /// use quincy_tun::DeviceBuilder;
     ///
     /// let dev = DeviceBuilder::new()
     ///     .ipv4("10.0.0.1", 24, None)
-    ///     .build_sync()?;
+    ///     .build_async()?;
     ///
     /// // Add additional IPv4 addresses
     /// dev.add_address_v4("10.0.1.1", 24)?;
@@ -1026,6 +1002,7 @@ impl DeviceImpl {
             .add_address(IpNet::new_assert(address.ipv4()?.into(), netmask.prefix()?))
             .map_err(io::Error::from)
     }
+
     /// Removes an IP address from the interface.
     ///
     /// For IPv4 addresses, it iterates over the current addresses and if a match is found,
@@ -1039,11 +1016,11 @@ impl DeviceImpl {
     /// # #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
     /// # {
     /// use std::net::IpAddr;
-    /// use tun_rs::DeviceBuilder;
+    /// use quincy_tun::DeviceBuilder;
     ///
     /// let dev = DeviceBuilder::new()
     ///     .ipv4("10.0.0.1", 24, None)
-    ///     .build_sync()?;
+    ///     .build_async()?;
     ///
     /// // Add an additional address
     /// dev.add_address_v4("10.0.1.1", 24)?;
@@ -1070,19 +1047,20 @@ impl DeviceImpl {
             IpAddr::V6(addr_v6) => {
                 let addrs = crate::platform::get_if_addrs_by_name(self.name_impl()?)?;
                 for x in addrs {
-                    if let Some(ip_addr) = x.address.ip_addr() {
-                        if ip_addr == addr {
-                            if let Some(netmask) = x.address.netmask() {
-                                let prefix = ipnet::ip_mask_to_prefix(netmask).unwrap_or(0);
-                                self.remove_address_v6_impl(addr_v6, prefix)?
-                            }
-                        }
+                    if x.address.ip_addr() != Some(addr) {
+                        continue;
                     }
+                    let Some(netmask) = x.address.netmask() else {
+                        continue;
+                    };
+                    let prefix = ipnet::ip_mask_to_prefix(netmask).unwrap_or(0);
+                    self.remove_address_v6_impl(addr_v6, prefix)?
                 }
             }
         }
         Ok(())
     }
+
     /// Adds an IPv6 address to the interface.
     ///
     /// This function creates an `in6_ifreq` structure, fills in the interface index,
@@ -1094,11 +1072,11 @@ impl DeviceImpl {
     /// ```no_run
     /// # #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
     /// # {
-    /// use tun_rs::DeviceBuilder;
+    /// use quincy_tun::DeviceBuilder;
     ///
     /// let dev = DeviceBuilder::new()
     ///     .ipv4("10.0.0.1", 24, None)
-    ///     .build_sync()?;
+    ///     .build_async()?;
     ///
     /// // Add IPv6 addresses
     /// dev.add_address_v6("fd00::1", 64)?;
@@ -1113,6 +1091,7 @@ impl DeviceImpl {
         netmask: Netmask,
     ) -> io::Result<()> {
         let _guard = self.op_lock.write().unwrap();
+        // SAFETY: ctl() returns a valid fd; request() returns a properly initialised ifreq.
         unsafe {
             let if_index = self.if_index_impl()?;
             let ctl = ctl_v6()?;
@@ -1129,12 +1108,14 @@ impl DeviceImpl {
         }
         Ok(())
     }
+
     /// Retrieves the current MTU (Maximum Transmission Unit) for the interface.
     ///
     /// This function constructs an interface request and uses a system call (via `siocgifmtu`)
     /// to obtain the MTU. The result is then converted to a u16.
     pub fn mtu(&self) -> io::Result<u16> {
         let _guard = self.op_lock.read().unwrap();
+        // SAFETY: ctl() returns a valid fd; request() returns a properly initialised ifreq.
         unsafe {
             let mut req = self.request()?;
 
@@ -1148,6 +1129,7 @@ impl DeviceImpl {
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("{e:?}")))
         }
     }
+
     /// Sets the MTU (Maximum Transmission Unit) for the interface.
     ///
     /// This function creates an interface request, sets the `ifru_mtu` field to the new value,
@@ -1158,12 +1140,12 @@ impl DeviceImpl {
     /// ```no_run
     /// # #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
     /// # {
-    /// use tun_rs::DeviceBuilder;
+    /// use quincy_tun::DeviceBuilder;
     ///
     /// let dev = DeviceBuilder::new()
     ///     .ipv4("10.0.0.1", 24, None)
     ///     .mtu(1400)
-    ///     .build_sync()?;
+    ///     .build_async()?;
     ///
     /// // Change MTU to accommodate larger packets
     /// dev.set_mtu(9000)?; // Jumbo frames
@@ -1173,6 +1155,7 @@ impl DeviceImpl {
     /// ```
     pub fn set_mtu(&self, value: u16) -> io::Result<()> {
         let _guard = self.op_lock.write().unwrap();
+        // SAFETY: ctl() returns a valid fd; request() returns a properly initialised ifreq.
         unsafe {
             let mut req = self.request()?;
             req.ifr_ifru.ifru_mtu = value as i32;
@@ -1183,6 +1166,7 @@ impl DeviceImpl {
             Ok(())
         }
     }
+
     /// Sets the MAC (hardware) address for the interface.
     ///
     /// This function constructs an interface request and copies the provided MAC address
@@ -1190,6 +1174,7 @@ impl DeviceImpl {
     /// This operation is typically supported only for TAP devices.
     pub fn set_mac_address(&self, eth_addr: [u8; ETHER_ADDR_LEN as usize]) -> io::Result<()> {
         let _guard = self.op_lock.write().unwrap();
+        // SAFETY: ctl() returns a valid fd; request() returns a properly initialised ifreq.
         unsafe {
             let mut req = self.request()?;
             req.ifr_ifru.ifru_hwaddr.sa_family = ARPHRD_ETHER;
@@ -1201,12 +1186,14 @@ impl DeviceImpl {
             Ok(())
         }
     }
+
     /// Retrieves the MAC (hardware) address of the interface.
     ///
     /// This function queries the MAC address by the interface name using a helper function.
     /// An error is returned if the MAC address cannot be found.
     pub fn mac_address(&self) -> io::Result<[u8; ETHER_ADDR_LEN as usize]> {
         let _guard = self.op_lock.read().unwrap();
+        // SAFETY: ctl() returns a valid fd; request() returns a properly initialised ifreq.
         unsafe {
             let mut req = self.request()?;
 
@@ -1224,31 +1211,36 @@ impl DeviceImpl {
     }
 }
 
+/// # Safety
+///
+/// `fd` must be a valid, open TUN file descriptor.
 unsafe fn name(fd: RawFd) -> io::Result<String> {
-    let mut req: ifreq = mem::zeroed();
-    if let Err(err) = tungetiff(fd, &mut req as *mut _ as *mut _) {
-        return Err(io::Error::from(err));
-    }
-    let c_str = std::ffi::CStr::from_ptr(req.ifr_name.as_ptr() as *const c_char);
-    let tun_name = c_str.to_string_lossy().into_owned();
-    Ok(tun_name)
-}
-
-unsafe fn request(name: &str) -> io::Result<ifreq> {
-    let mut req: ifreq = mem::zeroed();
-    ptr::copy_nonoverlapping(
-        name.as_ptr() as *const c_char,
-        req.ifr_name.as_mut_ptr(),
-        name.len(),
-    );
-    Ok(req)
-}
-
-impl From<Layer> for c_short {
-    fn from(layer: Layer) -> Self {
-        match layer {
-            Layer::L2 => IFF_TAP as c_short,
-            Layer::L3 => IFF_TUN as c_short,
+    unsafe {
+        // SAFETY: `ifreq` is POD (zeroed is valid); `fd` is valid per the safety contract;
+        // `tungetiff` fills `req` with the kernel's data.
+        let mut req: ifreq = mem::zeroed();
+        if let Err(err) = tungetiff(fd, &mut req as *mut _ as *mut _) {
+            return Err(io::Error::from(err));
         }
+        let c_str = std::ffi::CStr::from_ptr(req.ifr_name.as_ptr() as *const c_char);
+        let tun_name = c_str.to_string_lossy().into_owned();
+        Ok(tun_name)
+    }
+}
+
+/// # Safety
+///
+/// `name` must be a valid interface name shorter than `IFNAMSIZ`.
+unsafe fn request(name: &str) -> io::Result<ifreq> {
+    unsafe {
+        // SAFETY: `ifreq` is POD (zeroed is valid); `name.len()` < IFNAMSIZ (checked by callers);
+        // the source and destination don't overlap.
+        let mut req: ifreq = mem::zeroed();
+        ptr::copy_nonoverlapping(
+            name.as_ptr() as *const c_char,
+            req.ifr_name.as_mut_ptr(),
+            name.len(),
+        );
+        Ok(req)
     }
 }

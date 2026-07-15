@@ -1,7 +1,5 @@
-use crate::platform::windows::{ffi, InterruptEvent};
 use crate::platform::DeviceImpl;
-use crate::SyncDevice;
-use bytes::buf::UninitSlice;
+use crate::platform::windows::{InterruptEvent, ffi};
 use std::future::Future;
 use std::io;
 use std::ops::Deref;
@@ -10,25 +8,16 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 
-/// An async Tun/Tap device wrapper around a Tun/Tap device.
+/// An async TUN device wrapper around a `DeviceImpl`.
 ///
-/// This type does not provide a split method, because this functionality can be achieved by instead wrapping the device in an Arc.
-///
-/// # Streams
-///
-/// If you need to produce a [`Stream`], you can look at [`DeviceFramed`](crate::async_framed::DeviceFramed).
-///
-/// **Note:** `DeviceFramed` is only available when the `async_framed` feature is enabled.
-///
-/// [`Stream`]: https://docs.rs/futures/0.3/futures/stream/trait.Stream.html
+/// This type does not provide a split method; wrap the device in an `Arc` if
+/// shared ownership is needed.
 ///
 /// # Examples
 ///
 /// ```no_run
-/// use tun_rs::{AsyncDevice, DeviceBuilder};
-///
-/// #[tokio::main]
-/// async fn main() -> std::io::Result<()> {
+/// # async fn _main() -> std::io::Result<()> {
+/// use quincy_tun::{AsyncDevice, DeviceBuilder};
 ///     // Create a TUN device with basic configuration
 ///     let dev = DeviceBuilder::new()
 ///         .name("tun0")
@@ -45,33 +34,32 @@ use std::task::{Context, Poll};
 ///     let n = dev.recv(&mut buf).await?;
 ///     println!("Received {} bytes: {:?}", n, &buf[..n]);
 ///
-///     Ok(())
-/// }
+/// # Ok(()) }
 /// ```
 pub struct AsyncDevice {
     inner: Arc<DeviceImpl>,
     recv_task_lock: Arc<Mutex<Option<RecvTask>>>,
     send_task_lock: Arc<Mutex<Option<SendTask>>>,
 }
+
 type RecvTask = blocking::Task<io::Result<(Vec<u8>, usize)>>;
 type SendTask = blocking::Task<io::Result<usize>>;
+
 impl Deref for AsyncDevice {
     type Target = DeviceImpl;
     fn deref(&self) -> &Self::Target {
         &self.inner
     }
 }
+
 impl Drop for AsyncDevice {
     fn drop(&mut self) {
         _ = self.inner.shutdown();
     }
 }
+
 impl AsyncDevice {
-    /// Creates a new async wrapper around a TUN/TAP device
-    pub fn new(device: SyncDevice) -> io::Result<AsyncDevice> {
-        AsyncDevice::new_dev(device.0)
-    }
-    /// Create a new `AsyncDevice` wrapping around a `Device`.
+    /// Creates a new `AsyncDevice` wrapping a `DeviceImpl`.
     pub(crate) fn new_dev(device: DeviceImpl) -> io::Result<AsyncDevice> {
         let inner = Arc::new(device);
 
@@ -81,7 +69,8 @@ impl AsyncDevice {
             send_task_lock: Arc::new(Mutex::new(None)),
         })
     }
-    /// Attempts to receive a single packet from the device
+
+    /// Attempts to receive a single packet from the device.
     ///
     /// # Caveats
     ///
@@ -101,6 +90,7 @@ impl AsyncDevice {
     /// This function may encounter any standard I/O error except `WouldBlock`.
     pub fn poll_recv(&self, cx: &mut Context<'_>, buf: &mut [u8]) -> Poll<io::Result<usize>> {
         let mut guard = self.recv_task_lock.lock().unwrap();
+
         let mut task = if let Some(task) = guard.take() {
             task
         } else {
@@ -139,54 +129,8 @@ impl AsyncDevice {
             }
         }
     }
-    #[allow(dead_code)]
-    pub(crate) fn poll_recv_uninit(
-        &self,
-        cx: &mut Context<'_>,
-        buf: &mut UninitSlice,
-    ) -> Poll<io::Result<usize>> {
-        let mut guard = self.recv_task_lock.lock().unwrap();
-        let mut task = if let Some(task) = guard.take() {
-            task
-        } else {
-            match self.inner.try_recv_uninit(buf) {
-                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {}
-                rs => return Poll::Ready(rs),
-            }
-            let device = self.inner.clone();
-            let size = buf.len();
-            blocking::unblock(move || {
-                let mut in_buf = vec![0; size];
-                let n = device.recv(&mut in_buf)?;
-                Ok((in_buf, n))
-            })
-        };
-        match Pin::new(&mut task).poll(cx) {
-            Poll::Ready(rs) => {
-                drop(guard);
-                match rs {
-                    Ok((packet, n)) => {
-                        if n > buf.len() {
-                            return Poll::Ready(Err(io::Error::new(
-                                io::ErrorKind::InvalidInput,
-                                "receive buffer too small",
-                            )));
-                        }
-                        unsafe {
-                            std::ptr::copy_nonoverlapping(packet.as_ptr(), buf.as_mut_ptr(), n);
-                        }
-                        Poll::Ready(Ok(n))
-                    }
-                    Err(e) => Poll::Ready(Err(e)),
-                }
-            }
-            Poll::Pending => {
-                guard.replace(task);
-                Poll::Pending
-            }
-        }
-    }
-    /// Attempts to send packet to the device
+
+    /// Attempts to send a packet to the device.
     ///
     /// # Caveats
     ///
@@ -206,6 +150,7 @@ impl AsyncDevice {
     /// This function may encounter any standard I/O error except `WouldBlock`.
     pub fn poll_send(&self, cx: &mut Context<'_>, src: &[u8]) -> Poll<io::Result<usize>> {
         let mut guard = self.send_task_lock.lock().unwrap();
+
         let mut task = if let Some(task) = guard.take() {
             task
         } else {
@@ -217,6 +162,7 @@ impl AsyncDevice {
             let buf = src.to_vec();
             blocking::unblock(move || device.send(&buf))
         };
+
         match Pin::new(&mut task).poll(cx) {
             Poll::Ready(rs) => {
                 drop(guard);
@@ -228,6 +174,7 @@ impl AsyncDevice {
             }
         }
     }
+
     /// Waits for the device to become readable.
     ///
     /// This function is usually paired with `try_recv()`.
@@ -266,6 +213,7 @@ impl AsyncDevice {
             self.readable().await?;
         }
     }
+
     /// Attempts to read a packet without blocking.
     #[inline]
     pub fn try_recv(&self, buf: &mut [u8]) -> io::Result<usize> {
@@ -295,6 +243,7 @@ impl AsyncDevice {
         std::mem::forget(cancel_guard);
         result
     }
+
     /// Attempts to write a packet without blocking.
     #[inline]
     pub fn try_send(&self, buf: &[u8]) -> io::Result<usize> {
@@ -307,12 +256,14 @@ struct ExitSignalGuard {
     cancel_event_handle: Arc<InterruptEvent>,
     exit_event: Arc<OwnedHandle>,
 }
+
 impl Drop for ExitSignalGuard {
     fn drop(&mut self) {
         drop(self.device.take());
         _ = ffi::set_event(self.exit_event.as_raw_handle());
     }
 }
+
 impl ExitSignalGuard {
     pub fn call<R>(
         &self,

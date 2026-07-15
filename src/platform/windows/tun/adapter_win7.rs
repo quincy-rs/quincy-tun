@@ -4,7 +4,7 @@ use windows_sys::Win32::Devices::DeviceAndDriverInstallation::{
 };
 use windows_sys::Win32::Devices::Properties::DEVPROP_TYPE_BINARY;
 use windows_sys::Win32::Foundation::{
-    CloseHandle, GetLastError, ERROR_INVALID_DATA, FILETIME, INVALID_HANDLE_VALUE,
+    CloseHandle, ERROR_INVALID_DATA, FILETIME, GetLastError, INVALID_HANDLE_VALUE,
 };
 use windows_sys::Win32::System::Threading::{
     GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
@@ -13,7 +13,7 @@ use windows_sys::Win32::System::Threading::{
 use crate::windows::{
     device::GUID_NETWORK_ADAPTER,
     ffi::{destroy_device_info_list, encode_utf16, enum_device_info},
-    tun::adapter::{get_device_name, DEVPKEY_Wintun_OwningProcess},
+    tun::adapter::{DEVPKEY_Wintun_OwningProcess, get_device_name},
 };
 
 #[repr(C)]

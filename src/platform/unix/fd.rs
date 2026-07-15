@@ -2,9 +2,6 @@ use std::io;
 use std::io::{IoSlice, IoSliceMut};
 use std::os::unix::io::{AsRawFd, IntoRawFd, RawFd};
 
-use bytes::buf::UninitSlice;
-use libc::{self, fcntl, F_GETFL, O_NONBLOCK};
-
 /// POSIX file descriptor support for `io` traits.
 pub(crate) struct Fd {
     pub(crate) inner: RawFd,
@@ -26,70 +23,77 @@ impl Fd {
         }
         Ok(unsafe { Self::new_unchecked(value) })
     }
+
+    /// Creates an `Fd` without checking that `value` is valid.
+    ///
+    /// # Safety
+    ///
+    /// `value` must be a valid, open file descriptor (or `-1` if the
+    /// `Fd` will never be used for I/O before being overwritten).
     pub(crate) unsafe fn new_unchecked(value: RawFd) -> Self {
-        Fd::new_unchecked_with_borrow(value, false)
+        unsafe {
+            // SAFETY: delegates to `new_unchecked_with_borrow` which only stores the value.
+            Fd::new_unchecked_with_borrow(value, false)
+        }
     }
+
+    /// Creates an `Fd` without checking that `value` is valid, optionally
+    /// marking it as borrowed (so `Drop` will not close it).
+    ///
+    /// # Safety
+    ///
+    /// `value` must be a valid, open file descriptor (or `-1`).
     pub(crate) unsafe fn new_unchecked_with_borrow(value: RawFd, borrow: bool) -> Self {
         Fd {
             inner: value,
             borrow,
         }
     }
-    pub(crate) fn is_nonblocking(&self) -> io::Result<bool> {
-        unsafe {
-            let flags = fcntl(self.inner, F_GETFL);
-            if flags == -1 {
-                return Err(io::Error::last_os_error());
-            }
-            Ok((flags & O_NONBLOCK) != 0)
-        }
-    }
+
     #[cfg(target_os = "macos")]
     pub(crate) fn set_cloexec(&self) -> io::Result<()> {
+        // SAFETY: `self.inner` is a valid open fd (invariant of Fd).
         unsafe {
-            let flags = fcntl(self.inner, libc::F_GETFD);
+            let flags = libc::fcntl(self.inner, libc::F_GETFD);
             if flags < 0 {
                 return Err(io::Error::last_os_error());
             }
-            if fcntl(self.inner, libc::F_SETFD, flags | libc::FD_CLOEXEC) < 0 {
+            if libc::fcntl(self.inner, libc::F_SETFD, flags | libc::FD_CLOEXEC) < 0 {
                 return Err(io::Error::last_os_error());
             }
             Ok(())
         }
     }
+
     /// Enable non-blocking mode
     pub fn set_nonblocking(&self, nonblocking: bool) -> io::Result<()> {
         let mut nonblocking = nonblocking as libc::c_int;
+        // SAFETY: fd is valid; `nonblocking` is a stack-local `c_int`.
         match unsafe { libc::ioctl(self.as_raw_fd(), libc::FIONBIO, &mut nonblocking) } {
             0 => Ok(()),
             _ => Err(io::Error::last_os_error()),
         }
     }
 
+    /// Reads up to `buf.len()` bytes from the file descriptor into `buf`.
     #[inline]
     pub fn read(&self, buf: &mut [u8]) -> io::Result<usize> {
         let fd = self.as_raw_fd();
+        // SAFETY: `fd` is valid; `buf.as_mut_ptr()` and `buf.len()` are correct for this slice.
         let amount = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut _, buf.len()) };
         if amount < 0 {
             return Err(io::Error::last_os_error());
         }
         Ok(amount as usize)
     }
-    #[inline]
-    #[allow(dead_code)]
-    pub(crate) fn read_uninit(&self, buf: &mut UninitSlice) -> io::Result<usize> {
-        let fd = self.as_raw_fd();
-        let amount = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut _, buf.len()) };
-        if amount < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(amount as usize)
-    }
+
+    /// Reads into multiple buffers using vectored I/O.
     #[inline]
     pub fn readv(&self, bufs: &mut [IoSliceMut<'_>]) -> io::Result<usize> {
         if bufs.len() > max_iov() {
             return Err(io::Error::from(io::ErrorKind::InvalidInput));
         }
+        // SAFETY: fd is valid; `bufs` is a valid slice of `IoSliceMut` whose pointers are valid.
         let amount = unsafe {
             libc::readv(
                 self.as_raw_fd(),
@@ -102,41 +106,26 @@ impl Fd {
         }
         Ok(amount as usize)
     }
-    #[inline]
-    #[cfg(any(
-        target_os = "macos",
-        target_os = "ios",
-        target_os = "tvos",
-        target_os = "freebsd",
-        target_os = "openbsd",
-        target_os = "netbsd"
-    ))]
-    pub(crate) fn readv_raw(&self, bufs: &mut [libc::iovec]) -> io::Result<usize> {
-        if bufs.len() > max_iov() {
-            return Err(io::Error::from(io::ErrorKind::InvalidInput));
-        }
-        let amount =
-            unsafe { libc::readv(self.as_raw_fd(), bufs.as_ptr(), bufs.len() as libc::c_int) };
-        if amount < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(amount as usize)
-    }
 
+    /// Writes up to `buf.len()` bytes from `buf` to the file descriptor.
     #[inline]
     pub fn write(&self, buf: &[u8]) -> io::Result<usize> {
         let fd = self.as_raw_fd();
+        // SAFETY: `fd` is valid; `buf.as_ptr()` and `buf.len()` are correct for this slice.
         let amount = unsafe { libc::write(fd, buf.as_ptr() as *const _, buf.len()) };
         if amount < 0 {
             return Err(io::Error::last_os_error());
         }
         Ok(amount as usize)
     }
+
+    /// Writes multiple buffers using vectored I/O.
     #[inline]
     pub fn writev(&self, bufs: &[IoSlice<'_>]) -> io::Result<usize> {
         if bufs.len() > max_iov() {
             return Err(io::Error::from(io::ErrorKind::InvalidInput));
         }
+        // SAFETY: fd is valid; `bufs` is a valid slice of `IoSlice` whose pointers are valid.
         let amount = unsafe {
             libc::writev(
                 self.as_raw_fd(),
@@ -150,6 +139,7 @@ impl Fd {
         Ok(amount as usize)
     }
 }
+
 #[cfg(any(
     target_os = "dragonfly",
     target_os = "freebsd",
@@ -189,6 +179,7 @@ impl IntoRawFd for Fd {
 impl Drop for Fd {
     fn drop(&mut self) {
         if !self.borrow && self.inner >= 0 {
+            // SAFETY: `self.inner` was checked `>= 0` and was a valid open fd when stored.
             unsafe { libc::close(self.inner) };
             self.inner = -1;
         }

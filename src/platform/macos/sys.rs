@@ -1,6 +1,6 @@
 use std::{ffi::c_void, os::raw::c_int};
 
-use libc::{c_char, c_short, c_uint, ifreq, sockaddr, sockaddr_in6, time_t, IFNAMSIZ};
+use libc::{IFNAMSIZ, c_char, c_short, c_uint, ifreq, sockaddr, sockaddr_in6, time_t};
 use nix::{ioctl_readwrite, ioctl_write_ptr};
 
 pub const UTUN_CONTROL_NAME: &str = "com.apple.net.utun_control";
@@ -107,6 +107,7 @@ pub struct in6_ifstat {
     pub ifs6_in_mcast: u_quad_t,  /* # of inbound multicast datagrams */
     pub ifs6_out_mcast: u_quad_t, /* # of outbound multicast datagrams */
 }
+
 #[allow(non_camel_case_types)]
 #[repr(C)]
 #[derive(Copy, Clone)]

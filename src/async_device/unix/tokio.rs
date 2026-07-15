@@ -2,49 +2,38 @@ use std::io;
 use std::task::{Context, Poll};
 
 use crate::platform::DeviceImpl;
-use ::tokio::io::unix::AsyncFd as TokioAsyncFd;
 use ::tokio::io::Interest;
-use bytes::buf::UninitSlice;
+use ::tokio::io::unix::AsyncFd as TokioAsyncFd;
 
-/// An async Tun/Tap device wrapper around a Tun/Tap device.
+/// An async TUN device wrapper around a [`DeviceImpl`].
 ///
 /// This type does not provide a split method, because this functionality can be achieved by instead wrapping the socket in an Arc.
-///
-/// # Streams
-///
-/// If you need to produce a `Stream`, you can look at `DeviceFramed`.
-///
-/// **Note:** `DeviceFramed` is only available when the `async_framed` feature is enabled.
-///
-/// [`Stream`]: https://docs.rs/futures/0.3/futures/stream/trait.Stream.html
 ///
 /// # Examples
 ///
 /// ```no_run
-/// use tun_rs::{AsyncDevice, DeviceBuilder};
+/// # async fn _main() -> std::io::Result<()> {
+/// use quincy_tun::{AsyncDevice, DeviceBuilder};
 ///
-/// #[tokio::main]
-/// async fn main() -> std::io::Result<()> {
-///     // Create a TUN device with basic configuration
-///     let dev = DeviceBuilder::new()
-///         .name("tun0")
-///         .mtu(1500)
-///         .ipv4("10.0.0.1", "255.255.255.0", None)
-///         .build_async()?;
+/// // Create a TUN device with basic configuration
+/// let dev = DeviceBuilder::new()
+///     .name("tun0")
+///     .mtu(1500)
+///     .ipv4("10.0.0.1", "255.255.255.0", None)
+///     .build_async()?;
 ///
-///     // Send a simple packet (Replace with real IP message)
-///     let packet = b"[IP Packet: 10.0.0.1 -> 10.0.0.2] Hello, Async TUN!";
-///     dev.send(packet).await?;
+/// // Send a simple packet (Replace with real IP message)
+/// let packet = b"[IP Packet: 10.0.0.1 -> 10.0.0.2] Hello, Async TUN!";
+/// dev.send(packet).await?;
 ///
-///     // Receive a packet
-///     let mut buf = [0u8; 1500];
-///     let n = dev.recv(&mut buf).await?;
-///     println!("Received {} bytes: {:?}", n, &buf[..n]);
-///
-///     Ok(())
-/// }
+/// // Receive a packet
+/// let mut buf = [0u8; 1500];
+/// let n = dev.recv(&mut buf).await?;
+/// println!("Received {} bytes: {:?}", n, &buf[..n]);
+/// # Ok(()) }
 /// ```
 pub struct AsyncDevice(pub(crate) TokioAsyncFd<DeviceImpl>);
+
 impl AsyncDevice {
     /// Polls the I/O handle for readability.
     ///
@@ -68,7 +57,8 @@ impl AsyncDevice {
     pub fn poll_readable(&self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         self.0.poll_read_ready(cx).map_ok(|_| ())
     }
-    /// Attempts to receive a single packet from the device
+
+    /// Attempts to receive a single packet from the device.
     ///
     /// # Caveats
     ///
@@ -103,27 +93,6 @@ impl AsyncDevice {
         }
     }
 
-    #[allow(dead_code)]
-    pub(crate) fn poll_recv_uninit(
-        &self,
-        cx: &mut Context<'_>,
-        buf: &mut UninitSlice,
-    ) -> Poll<io::Result<usize>> {
-        loop {
-            return match self.0.poll_read_ready(cx) {
-                Poll::Ready(Ok(mut rs)) => {
-                    let n = match rs.try_io(|dev| dev.get_ref().recv_uninit(buf)) {
-                        Ok(rs) => rs?,
-                        Err(_) => continue,
-                    };
-                    Poll::Ready(Ok(n))
-                }
-                Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
-                Poll::Pending => Poll::Pending,
-            };
-        }
-    }
-
     /// Polls the I/O handle for writability.
     ///
     /// # Caveats
@@ -146,7 +115,8 @@ impl AsyncDevice {
     pub fn poll_writable(&self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         self.0.poll_write_ready(cx).map_ok(|_| ())
     }
-    /// Attempts to send packet to the device
+
+    /// Attempts to send a packet to the device.
     ///
     /// # Caveats
     ///
@@ -187,6 +157,7 @@ impl AsyncDevice {
         device.set_nonblocking(true)?;
         Ok(Self(TokioAsyncFd::new(device)?))
     }
+
     pub(crate) fn into_device(self) -> io::Result<DeviceImpl> {
         Ok(self.0.into_inner())
     }
@@ -199,6 +170,7 @@ impl AsyncDevice {
             .async_io(Interest::READABLE, |device| op(device))
             .await
     }
+
     pub(crate) async fn write_with<R>(
         &self,
         mut op: impl FnMut(&DeviceImpl) -> io::Result<R>,

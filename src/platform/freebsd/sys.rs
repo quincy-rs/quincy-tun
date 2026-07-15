@@ -1,19 +1,10 @@
-use libc::{c_char, c_int, c_uint, ifreq, sockaddr, sockaddr_in6, time_t, IFNAMSIZ};
+use libc::{IFNAMSIZ, c_char, c_int, ifreq, sockaddr, sockaddr_in6, time_t};
 use nix::{ioctl_readwrite, ioctl_write_ptr};
 use std::ffi::c_void;
 
 //pub const IN6_IFF_NODAD: i32 = 0x0020;
 pub const IN6_IFF_NODAD: i32 = 0x100;
 pub const ND6_IFF_AUTO_LINKLOCAL: i32 = 0x20;
-
-#[allow(dead_code)]
-#[allow(non_camel_case_types)]
-#[repr(C)]
-#[derive(Copy, Clone)]
-pub struct ctl_info {
-    pub ctl_id: c_uint,
-    pub ctl_name: [c_char; 96],
-}
 
 #[allow(non_camel_case_types)]
 #[repr(C)]
@@ -211,6 +202,7 @@ pub struct in6_ndireq {
     pub ifra_name: [c_char; IFNAMSIZ],
     pub ndi: nd_ifinfo,
 }
+
 #[allow(non_camel_case_types)]
 #[repr(C)]
 #[derive(Copy, Clone)]
@@ -255,8 +247,6 @@ ioctl_write_ptr!(siocifcreate, b'i', 122, ifreq);
 ioctl_write_ptr!(siocsifphyaddr, b'i', 70, ifaliasreq);
 
 ioctl_write_ptr!(siocsifname, b'i', 40, ifreq);
-
-ioctl_write_ptr!(siocsiflladdr, b'i', 60, ifreq);
 
 ioctl_write_ptr!(siocifdestroy, b'i', 121, ifreq);
 

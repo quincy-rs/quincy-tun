@@ -1,0 +1,63 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTDOCFLAGS: -D warnings
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - run: rustup target add aarch64-unknown-linux-gnu aarch64-linux-android
+      - run: cargo fmt --all -- --check
+      - run: cargo test --all-targets
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo doc --no-deps
+      - run: cargo check --target aarch64-unknown-linux-gnu
+      - run: cargo check --target aarch64-linux-android
+
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+      - run: rustup target add x86_64-apple-darwin aarch64-apple-darwin x86_64-apple-ios aarch64-apple-ios
+      - run: cargo test --all-targets
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo check --target x86_64-apple-darwin
+      - run: cargo check --target aarch64-apple-darwin
+      - run: cargo check --target x86_64-apple-ios
+      - run: cargo check --target aarch64-apple-ios
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+      - run: cargo test --all-targets
+      - run: cargo clippy --all-targets -- -D warnings
+
+  freebsd:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: cross-platform-actions/action@v1.3.0
+        with:
+          operating_system: freebsd
+          architecture: x86-64
+          version: "14.2"
+          memory: 5G
+          cpu_count: 4
+          shell: bash
+          run: |
+            sudo pkg install -y curl
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+            . "$HOME/.cargo/env"
+            rustup component add clippy
+            cargo test --all-targets
+            cargo clippy --all-targets -- -D warnings
+            rustup toolchain install nightly --profile minimal --component rust-src
+            cargo +nightly check -Z build-std --target aarch64-unknown-freebsd

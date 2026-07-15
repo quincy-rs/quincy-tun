@@ -12,13 +12,13 @@ use std::io;
 use std::net::IpAddr;
 use std::sync::OnceLock;
 
-use libloading::os::windows::{Library, Symbol, LOAD_LIBRARY_SEARCH_SYSTEM32};
-use windows_sys::core::GUID;
+use libloading::os::windows::{LOAD_LIBRARY_SEARCH_SYSTEM32, Library, Symbol};
 use windows_sys::Win32::NetworkManagement::IpHelper::{
     DNS_INTERFACE_SETTINGS, DNS_INTERFACE_SETTINGS_VERSION1, DNS_SETTING_IPV6,
     DNS_SETTING_NAMESERVER,
 };
 use windows_sys::Win32::NetworkManagement::Ndis::NET_LUID_LH;
+use windows_sys::core::GUID;
 
 use super::ffi;
 use super::netsh;
@@ -138,7 +138,7 @@ pub fn clear_dns_servers(index: u32, luid: &NET_LUID_LH, is_ipv4: bool) -> io::R
 // `DnsFlushResolverCache` has been exported by `dnsapi.dll` on every supported Windows
 // version, so unlike `SetInterfaceDnsSettings` it is safe to link statically.
 #[link(name = "dnsapi")]
-extern "system" {
+unsafe extern "system" {
     fn DnsFlushResolverCache() -> i32;
 }
 
@@ -147,9 +147,7 @@ extern "system" {
 fn flush_resolver_cache() {
     // SAFETY: the function takes no arguments and is always present in `dnsapi.dll`.
     if unsafe { DnsFlushResolverCache() } == 0 {
-        log::warn!(
-            "DnsFlushResolverCache failed: {}",
-            io::Error::last_os_error()
-        );
+        let error = io::Error::last_os_error();
+        log::warn!("DnsFlushResolverCache failed: {error}");
     }
 }

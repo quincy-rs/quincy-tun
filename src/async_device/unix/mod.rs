@@ -1,34 +1,31 @@
-#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
-use crate::platform::offload::{handle_gro, VirtioNetHdr, VIRTIO_NET_HDR_LEN};
 use crate::platform::DeviceImpl;
 #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
 use crate::platform::GROTable;
-use crate::SyncDevice;
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+use crate::platform::offload::{VIRTIO_NET_HDR_LEN, VirtioNetHdr, handle_gro};
 use std::io;
 use std::io::{IoSlice, IoSliceMut};
 use std::ops::Deref;
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, RawFd};
 
-#[cfg(feature = "async_tokio")]
 mod tokio;
-#[cfg(feature = "async_tokio")]
 pub use self::tokio::AsyncDevice;
-
-#[cfg(all(feature = "async_io", not(feature = "async_tokio")))]
-mod async_io;
-#[cfg(all(feature = "async_io", not(feature = "async_tokio")))]
-pub use self::async_io::AsyncDevice;
 
 impl FromRawFd for AsyncDevice {
     unsafe fn from_raw_fd(fd: RawFd) -> Self {
-        AsyncDevice::from_fd(fd).unwrap()
+        unsafe {
+            // SAFETY: caller guarantees `fd` is a valid, open TUN fd (FromRawFd contract).
+            AsyncDevice::from_fd(fd).unwrap()
+        }
     }
 }
+
 impl IntoRawFd for AsyncDevice {
     fn into_raw_fd(self) -> RawFd {
         self.into_fd().unwrap()
     }
 }
+
 impl AsRawFd for AsyncDevice {
     fn as_raw_fd(&self) -> RawFd {
         self.get_ref().as_raw_fd()
@@ -44,31 +41,23 @@ impl Deref for AsyncDevice {
 }
 
 impl AsyncDevice {
-    #[allow(dead_code)]
-    pub fn new(device: SyncDevice) -> io::Result<AsyncDevice> {
-        AsyncDevice::new_dev(device.0)
-    }
-
+    /// Constructs an `AsyncDevice` from an existing raw file descriptor.
+    ///
     /// # Safety
-    /// This method is safe if the provided fd is valid
-    /// Construct a AsyncDevice from an existing file descriptor
+    ///
+    /// `fd` must be a valid, open file descriptor for a TUN device.
     pub unsafe fn from_fd(fd: RawFd) -> io::Result<AsyncDevice> {
-        AsyncDevice::new_dev(DeviceImpl::from_fd(fd)?)
+        unsafe {
+            // SAFETY: caller guarantees `fd` is valid (per `/// # Safety`).
+            AsyncDevice::new_dev(DeviceImpl::from_fd(fd)?)
+        }
     }
 
-    /// # Safety
-    /// The fd passed in must be a valid, open file descriptor.
-    /// Unlike [`from_fd`], this function does **not** take ownership of `fd`,
-    /// and therefore will not close it when dropped.  
-    /// The caller is responsible for ensuring the lifetime and eventual closure of `fd`.
-    #[allow(dead_code)]
-    pub(crate) unsafe fn borrow_raw(fd: RawFd) -> io::Result<Self> {
-        AsyncDevice::new_dev(DeviceImpl::borrow_raw(fd)?)
-    }
-
+    /// Consumes the async device and returns the underlying raw file descriptor.
     pub fn into_fd(self) -> io::Result<RawFd> {
         Ok(self.into_device()?.into_raw_fd())
     }
+
     /// Waits for the device to become readable.
     ///
     /// This function is usually paired with `try_recv()` for manual readiness-based I/O.
@@ -87,9 +76,8 @@ impl AsyncDevice {
     /// # Example
     ///
     /// ```no_run
-    /// # #[cfg(all(unix, any(feature = "async_io", feature = "async_tokio")))]
     /// # async fn example() -> std::io::Result<()> {
-    /// use tun_rs::DeviceBuilder;
+    /// use quincy_tun::DeviceBuilder;
     ///
     /// let dev = DeviceBuilder::new()
     ///     .ipv4("10.0.0.1", 24, None)
@@ -113,6 +101,7 @@ impl AsyncDevice {
     pub async fn readable(&self) -> io::Result<()> {
         self.0.readable().await.map(|_| ())
     }
+
     /// Waits for the device to become writable.
     ///
     /// This function is usually paired with `try_send()` for manual readiness-based I/O.
@@ -131,9 +120,8 @@ impl AsyncDevice {
     /// # Example
     ///
     /// ```no_run
-    /// # #[cfg(all(unix, any(feature = "async_io", feature = "async_tokio")))]
     /// # async fn example() -> std::io::Result<()> {
-    /// use tun_rs::DeviceBuilder;
+    /// use quincy_tun::DeviceBuilder;
     ///
     /// let dev = DeviceBuilder::new()
     ///     .ipv4("10.0.0.1", 24, None)
@@ -159,6 +147,7 @@ impl AsyncDevice {
     pub async fn writable(&self) -> io::Result<()> {
         self.0.writable().await.map(|_| ())
     }
+
     /// Receives a single packet from the device.
     /// On success, returns the number of bytes read.
     ///
@@ -168,6 +157,7 @@ impl AsyncDevice {
     pub async fn recv(&self, buf: &mut [u8]) -> io::Result<usize> {
         self.read_with(|device| device.recv(buf)).await
     }
+
     /// Tries to receive a single packet from the device.
     /// On success, returns the number of bytes read.
     ///
@@ -181,14 +171,15 @@ impl AsyncDevice {
         self.try_read_io(|device| device.recv(buf))
     }
 
-    /// Send a packet to the device
+    /// Sends a packet to the device.
     ///
     /// # Return
     /// On success, the number of bytes sent is returned, otherwise, the encountered error is returned.
     pub async fn send(&self, buf: &[u8]) -> io::Result<usize> {
         self.write_with(|device| device.send(buf)).await
     }
-    /// Tries to send packet to the device.
+
+    /// Tries to send a packet to the device.
     ///
     /// When the device buffer is full, `Err(io::ErrorKind::WouldBlock)` is
     /// returned. This function is usually paired with `writable()`.
@@ -201,19 +192,23 @@ impl AsyncDevice {
     pub fn try_send(&self, buf: &[u8]) -> io::Result<usize> {
         self.try_write_io(|device| device.send(buf))
     }
+
     /// Receives a packet into multiple buffers (scatter read).
     /// **Processes single packet per call**.
     pub async fn recv_vectored(&self, bufs: &mut [IoSliceMut<'_>]) -> io::Result<usize> {
         self.read_with(|device| device.recv_vectored(bufs)).await
     }
+
     /// Non-blocking version of `recv_vectored`.
     pub fn try_recv_vectored(&self, bufs: &mut [IoSliceMut<'_>]) -> io::Result<usize> {
         self.try_read_io(|device| device.recv_vectored(bufs))
     }
+
     /// Sends multiple buffers as a single packet (gather write).
     pub async fn send_vectored(&self, bufs: &[IoSlice<'_>]) -> io::Result<usize> {
         self.write_with(|device| device.send_vectored(bufs)).await
     }
+
     /// Non-blocking version of `send_vectored`.
     pub fn try_send_vectored(&self, bufs: &[IoSlice<'_>]) -> io::Result<usize> {
         self.try_write_io(|device| device.send_vectored(bufs))
@@ -222,21 +217,13 @@ impl AsyncDevice {
 
 #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
 impl AsyncDevice {
-    /// # Prerequisites
-    /// - The `IFF_MULTI_QUEUE` flag must be enabled.
-    /// - The system must support network interface multi-queue functionality.
+    /// Receives one packet from the device and, when offload is enabled, splits
+    /// it into separate segment buffers.
     ///
-    /// # Description
-    /// When multi-queue is enabled, create a new queue by duplicating an existing one.
-    pub fn try_clone(&self) -> io::Result<Self> {
-        AsyncDevice::new_dev(self.get_ref().try_clone()?)
-    }
-    /// Recv a packet from the device.
-    /// If offload is enabled. This method can be used to obtain processed data.
-    ///
-    /// original_buffer is used to store raw data, including the VirtioNetHdr and the unsplit IP packet. The recommended size is 10 + 65535.
-    /// bufs and sizes are used to store the segmented IP packets. bufs.len == sizes.len > 65535/MTU
-    /// offset: Starting position
+    /// `original_buffer` holds the raw data including the `VirtioNetHdr` and the
+    /// unsplit IP packet. `bufs` and `sizes` receive the segmented IP packets and
+    /// must have equal lengths. `offset` is the starting position within each
+    /// segment buffer.
     #[cfg(target_os = "linux")]
     pub async fn recv_multiple<B: AsRef<[u8]> + AsMut<[u8]>>(
         &self,
@@ -248,13 +235,16 @@ impl AsyncDevice {
         if bufs.is_empty() || bufs.len() != sizes.len() {
             return Err(io::Error::other("bufs error"));
         }
+
         if bufs.len() > u16::MAX as usize {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "too many packet buffers",
             ));
         }
+
         let tun = self.get_ref();
+
         if tun.vnet_hdr {
             let len = self.recv(original_buffer).await?;
             if len <= VIRTIO_NET_HDR_LEN {
@@ -277,14 +267,18 @@ impl AsyncDevice {
                     "invalid offset",
                 ));
             };
+
             let len = self.recv(buf).await?;
             sizes[0] = len;
             Ok(1)
         }
     }
-    /// send multiple fragmented data packets.
-    /// GROTable can be reused, as it is used to assist in data merging.
-    /// Offset is the starting position of the data. Need to meet offset>10.
+
+    /// Sends multiple fragmented data packets, optionally merging via GRO.
+    ///
+    /// `gro_table` may be reused across calls to assist coalescing. `offset`
+    /// must be large enough to reserve `VIRTIO_NET_HDR_LEN` bytes when
+    /// virtual network headers are enabled (i.e. `offset > 10`).
     #[cfg(target_os = "linux")]
     pub async fn send_multiple<B: crate::platform::ExpandBuffer>(
         &self,
@@ -293,16 +287,20 @@ impl AsyncDevice {
         mut offset: usize,
     ) -> io::Result<usize> {
         gro_table.reset();
+
         if bufs.is_empty() {
             return Ok(0);
         }
+
         if bufs.len() > u16::MAX as usize {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "too many packet buffers",
             ));
         }
+
         let tun = self.get_ref();
+
         if tun.vnet_hdr {
             handle_gro(
                 bufs,
@@ -321,6 +319,7 @@ impl AsyncDevice {
 
         let mut total = 0;
         let mut err = Ok(());
+
         for buf_idx in &gro_table.to_write {
             let Some(buf) = bufs[*buf_idx].as_ref().get(offset..) else {
                 return Err(io::Error::new(
@@ -333,10 +332,8 @@ impl AsyncDevice {
                     total += n;
                 }
                 Err(e) => {
-                    if let Some(code) = e.raw_os_error() {
-                        if libc::EBADFD == code {
-                            return Err(e);
-                        }
+                    if e.raw_os_error() == Some(libc::EBADFD) {
+                        return Err(e);
                     }
                     err = Err(e)
                 }

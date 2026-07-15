@@ -1,15 +1,14 @@
-use bytes::buf::UninitSlice;
 use std::os::windows::io::{AsRawHandle, OwnedHandle};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, RwLock};
 use std::{io, ptr};
-use windows_sys::core::GUID;
 use windows_sys::Win32::Foundation::{
-    GetLastError, ERROR_BUFFER_OVERFLOW, ERROR_HANDLE_EOF, ERROR_INVALID_DATA, ERROR_NO_MORE_ITEMS,
+    ERROR_BUFFER_OVERFLOW, ERROR_HANDLE_EOF, ERROR_INVALID_DATA, ERROR_NO_MORE_ITEMS, GetLastError,
     WAIT_FAILED, WAIT_OBJECT_0,
 };
 use windows_sys::Win32::NetworkManagement::Ndis::NET_LUID_LH;
-use windows_sys::Win32::System::Threading::{WaitForMultipleObjects, INFINITE};
+use windows_sys::Win32::System::Threading::{INFINITE, WaitForMultipleObjects};
+use windows_sys::core::GUID;
 
 use crate::platform::windows::ffi;
 use crate::platform::windows::ffi::encode_utf16;
@@ -35,6 +34,7 @@ pub struct TunDevice {
     luid: NET_LUID_LH,
     win_tun_adapter: WinTunAdapter,
 }
+
 struct WinTunAdapter {
     win_tun: Arc<wintun_raw::wintun>,
     handle: wintun_raw::WINTUN_ADAPTER_HANDLE,
@@ -44,6 +44,7 @@ struct WinTunAdapter {
     session: RwLock<Option<WinTunSession>>,
     delete_driver: bool,
 }
+
 unsafe impl Send for WinTunAdapter {}
 unsafe impl Sync for WinTunAdapter {}
 struct WinTunSession {
@@ -51,6 +52,7 @@ struct WinTunSession {
     handle: wintun_raw::WINTUN_SESSION_HANDLE,
     read_event: wintun_raw::HANDLE,
 }
+
 impl Drop for WinTunAdapter {
     fn drop(&mut self) {
         let session = self.session.write().unwrap().take();
@@ -63,11 +65,13 @@ impl Drop for WinTunAdapter {
         }
     }
 }
+
 #[derive(Default)]
 struct State {
     state: AtomicBool,
     lock: Mutex<()>,
 }
+
 impl State {
     fn check(&self) -> io::Result<()> {
         if self.is_enabled() {
@@ -76,22 +80,28 @@ impl State {
             Err(io::Error::other("The interface has been disabled"))
         }
     }
+
     fn is_disabled(&self) -> bool {
         !self.state.load(Ordering::Relaxed)
     }
+
     fn is_enabled(&self) -> bool {
         self.state.load(Ordering::Relaxed)
     }
+
     fn disable(&self) {
         self.state.store(false, Ordering::Relaxed);
     }
+
     fn enable(&self) {
         self.state.store(true, Ordering::Relaxed);
     }
+
     fn lock(&self) -> MutexGuard<'_, ()> {
         self.lock.lock().unwrap()
     }
 }
+
 impl WinTunAdapter {
     fn disable(&self) -> io::Result<()> {
         let _guard = self.state.lock();
@@ -135,6 +145,7 @@ impl WinTunAdapter {
         }
         Ok(())
     }
+
     fn version(&self) -> io::Result<String> {
         let version = unsafe { self.win_tun.WintunGetRunningDriverVersion() };
         let v = version.to_be_bytes();
@@ -144,6 +155,7 @@ impl WinTunAdapter {
             u16::from_be_bytes([v[2], v[3]])
         ))
     }
+
     fn send(&self, buf: &[u8], event: Option<&OwnedHandle>) -> io::Result<usize> {
         let guard = self.session.read().unwrap();
         if let Some(session) = guard.as_ref() {
@@ -151,6 +163,7 @@ impl WinTunAdapter {
         }
         Err(io::Error::other("The interface has been disabled"))
     }
+
     fn recv(&self, buf: &mut [u8]) -> io::Result<usize> {
         let guard = self.session.read().unwrap();
         if let Some(session) = guard.as_ref() {
@@ -158,6 +171,7 @@ impl WinTunAdapter {
         }
         Err(io::Error::other("The interface has been disabled"))
     }
+
     fn try_send(&self, buf: &[u8]) -> io::Result<usize> {
         let guard = self.session.read().unwrap();
         if let Some(session) = guard.as_ref() {
@@ -165,6 +179,7 @@ impl WinTunAdapter {
         }
         Err(io::Error::other("The interface has been disabled"))
     }
+
     fn try_recv(&self, buf: &mut [u8]) -> io::Result<usize> {
         let guard = self.session.read().unwrap();
         if let Some(session) = guard.as_ref() {
@@ -172,14 +187,7 @@ impl WinTunAdapter {
         }
         Err(io::Error::other("The interface has been disabled"))
     }
-    #[allow(dead_code)]
-    fn try_recv_uninit(&self, buf: &mut UninitSlice) -> io::Result<usize> {
-        let guard = self.session.read().unwrap();
-        if let Some(session) = guard.as_ref() {
-            return session.try_recv_uninit(buf);
-        }
-        Err(io::Error::other("The interface has been disabled"))
-    }
+
     fn wait_readable_interruptible(
         &self,
         interrupt_event: &OwnedHandle,
@@ -214,13 +222,13 @@ impl WinTunSession {
                     if start.elapsed() > timeout {
                         return Err(io::Error::from(io::ErrorKind::TimedOut));
                     }
-                    if let Some(event) = event {
-                        if ffi::wait_for_single_object(event.as_raw_handle(), 0).is_ok() {
-                            return Err(io::Error::new(
-                                io::ErrorKind::Interrupted,
-                                "trigger interrupt",
-                            ));
-                        }
+                    if event.is_some_and(|event| {
+                        ffi::wait_for_single_object(event.as_raw_handle(), 0).is_ok()
+                    }) {
+                        return Err(io::Error::new(
+                            io::ErrorKind::Interrupted,
+                            "trigger interrupt",
+                        ));
                     }
                     // Exponential backoff: 0, 1, 2, 4, 8, capped at 10ms
                     if backoff.is_zero() {
@@ -236,6 +244,7 @@ impl WinTunSession {
             };
         }
     }
+
     fn recv(&self, inner_event: &OwnedHandle, buf: &mut [u8]) -> io::Result<usize> {
         loop {
             // Limit spin iterations to reduce CPU waste; use yield_now after a few spins
@@ -257,6 +266,7 @@ impl WinTunSession {
             self.wait_readable(inner_event)?;
         }
     }
+
     fn try_send(&self, buf: &[u8]) -> io::Result<usize> {
         if buf.len() > u32::MAX as usize {
             return Err(io::Error::new(
@@ -284,13 +294,11 @@ impl WinTunSession {
             Ok(buf.len())
         }
     }
+
     fn try_recv(&self, buf: &mut [u8]) -> io::Result<usize> {
         self.try_recv_raw(buf.as_mut_ptr(), buf.len())
     }
-    #[allow(dead_code)]
-    fn try_recv_uninit(&self, buf: &mut UninitSlice) -> io::Result<usize> {
-        self.try_recv_raw(buf.as_mut_ptr(), buf.len())
-    }
+
     fn try_recv_raw(&self, dst: *mut u8, dst_len: usize) -> io::Result<usize> {
         let mut size = 0u32;
 
@@ -316,6 +324,7 @@ impl WinTunSession {
         unsafe { win_tun.WintunReleaseReceivePacket(handle, ptr) };
         Ok(size)
     }
+
     fn wait_readable_interruptible(
         &self,
         inner_event: &OwnedHandle,
@@ -362,6 +371,7 @@ impl WinTunSession {
             }
         }
     }
+
     fn wait_readable(&self, inner_event: &OwnedHandle) -> io::Result<()> {
         //Wait on both the read handle and the shutdown handle so that we stop when requested
         let handles = [self.read_event, inner_event.as_raw_handle()];
@@ -445,6 +455,7 @@ impl TunDevice {
             Ok(tun)
         }
     }
+
     pub fn create(
         wintun_path: &str,
         name: &str,
@@ -524,26 +535,33 @@ impl TunDevice {
             Ok(tun)
         }
     }
+
     pub fn luid(&self) -> NET_LUID_LH {
         self.luid
     }
+
     pub fn index(&self) -> u32 {
         self.index
     }
+
     pub fn get_name(&self) -> io::Result<String> {
         ffi::luid_to_alias(&self.luid)
     }
+
     #[inline]
     pub fn send(&self, buf: &[u8]) -> io::Result<usize> {
         self.win_tun_adapter.send(buf, None)
     }
 
-    #[allow(dead_code)]
     #[inline]
-    pub(crate) fn send_interruptible(&self, buf: &[u8], event: &OwnedHandle) -> io::Result<usize> {
-        self.win_tun_adapter.send(buf, Some(event))
+    pub(crate) fn send_interruptible(
+        &self,
+        buf: &[u8],
+        interrupt_event: &OwnedHandle,
+    ) -> io::Result<usize> {
+        self.win_tun_adapter.send(buf, Some(interrupt_event))
     }
-    #[allow(dead_code)]
+
     #[inline]
     pub(crate) fn wait_readable_interruptible(
         &self,
@@ -553,29 +571,30 @@ impl TunDevice {
         self.win_tun_adapter
             .wait_readable_interruptible(interrupt_event, timeout)
     }
+
     #[inline]
     pub fn recv(&self, buf: &mut [u8]) -> io::Result<usize> {
         self.win_tun_adapter.recv(buf)
     }
+
     #[inline]
     pub fn try_send(&self, buf: &[u8]) -> io::Result<usize> {
         self.win_tun_adapter.try_send(buf)
     }
+
     #[inline]
     pub fn try_recv(&self, buf: &mut [u8]) -> io::Result<usize> {
         self.win_tun_adapter.try_recv(buf)
     }
-    #[inline]
-    #[allow(dead_code)]
-    pub(crate) fn try_recv_uninit(&self, buf: &mut UninitSlice) -> io::Result<usize> {
-        self.win_tun_adapter.try_recv_uninit(buf)
-    }
+
     pub fn shutdown(&self) -> io::Result<()> {
         self.win_tun_adapter.disable()
     }
+
     pub fn version(&self) -> io::Result<String> {
         self.win_tun_adapter.version()
     }
+
     pub fn enabled(&self, value: bool) -> io::Result<()> {
         if value {
             self.win_tun_adapter.enable()

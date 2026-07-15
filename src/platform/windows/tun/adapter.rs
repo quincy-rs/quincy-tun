@@ -7,17 +7,17 @@ use crate::windows::{
 use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
 use windows_sys::Win32::Foundation::{DEVPROPKEY, ERROR_INSUFFICIENT_BUFFER};
 use windows_sys::{
-    core::GUID,
     Win32::{
         Devices::{
             DeviceAndDriverInstallation::{
-                CM_Get_DevNode_Status, SetupDiGetClassDevsExW, SetupDiGetDevicePropertyW,
-                CM_DEVNODE_STATUS_FLAGS, CR_SUCCESS, DN_HAS_PROBLEM, HDEVINFO, SP_DEVINFO_DATA,
+                CM_DEVNODE_STATUS_FLAGS, CM_Get_DevNode_Status, CR_SUCCESS, DN_HAS_PROBLEM,
+                HDEVINFO, SP_DEVINFO_DATA, SetupDiGetClassDevsExW, SetupDiGetDevicePropertyW,
             },
             Properties::DEVPROPID_FIRST_USABLE,
         },
         System::SystemInformation::{GetVersionExA, OSVERSIONINFOA},
     },
+    core::GUID,
 };
 
 #[allow(non_upper_case_globals)]
